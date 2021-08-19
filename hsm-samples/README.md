@@ -102,6 +102,97 @@ npm run build
 npm start
 ```
 
+### Java SDK
+
+Java does HSM differently to Go and Node. For Java you need a PKCS11 security provider and each one will potentially work slighly different
+to the others.
+
+The instructions here are specific to getting SoftHSM working with the Sun PKCS11 Security provider, different PKCS11 providers and maybe
+even different HSMs may require a different procedure
+
+#### Getting an identity into SoftHSM
+
+Unfortunately you can't use the fabric-ca-client binary or the SDKs to perform this. The Sun PKCS11 Security provider requires identities to be stored in a manner it expects otherwise it will ignore them or will not return a PrivateKey object representative of Elliptic Curve
+required for signing.
+
+#### Configure Sub PKCS11 Security provider to use SoftHSM
+
+1. Create options file with the following contents (assuming that the softhsm library is located in `/usr/lib/softhsm/libsofthsm2.so`)
+
+```
+library=/usr/lib/softhsm/libsofthsm2.so
+name=softhsm2
+slotListIndex=0
+attributes(*,CKO_PRIVATE_KEY,*) = {
+  CKA_SENSITIVE = false
+  CKA_EXTRACTABLE = true
+}
+```
+
+`slotListIndex` assumes you have followed this README and you have created a single slot. The `attributes` section insures that keys and certificates imported into the HSM can be correctly retrieved as Elliptic Curve private keys rather than just generic private keys.
+
+store this file somewhere appropriate, for the purposes of this sample assume it's /var/pkcs11.cfg
+
+2. configure jre security provider
+locate `java.security` file in your Java JRE/SDK installation, eg $JAVA_HOME/conf/Security
+edit the file and locate the SunPKCS11 entry, eg
+
+```
+security.provider.12=SunPKCS11
+```
+
+and update it to point to the options file you have created, eg
+
+```
+security.provider.12=SunPKCS11 /var/pkcs11.cfg
+```
+
+#### Convert and import an existing identity into the HSM
+
+ 1. cp fabric-gateway/scenario/fixtures/crypto-material/crypto-config/peerOrganizations/org1.example.com/users/User1@org1.example.com/msp/signcerts/User1@org1.example.com-cert.pem hsmuser.pem
+ 2. cp fabric-gateway/scenario/fixtures/crypto-material/crypto-config/peerOrganizations/org1.example.com/users/User1@org1.example.com/msp/keystore/key.pem
+ 3. openssl pkcs12 -export -in hsmuser.pem -inkey key.pem -out hsmuser.p12 (set password for .p12 keystore)
+ 4. keytool -importkeystore -deststorepass 98765432 -destkeystore NONE -deststoretype PKCS11 -srckeystore hsmuser.p12 -srcstoretype PKCS12 (use .p12 keystore password)
+ 5. keytool -changealias -keystore NONE -storetype PKCS11 -alias "1" -destalias "HSMUser" (use HSM pin)
+
+#### Convert Java Sample to use Private Key from HSM rather than from file system
+
+In the original sample, the private key is obtained from the private key file. Here the difference is the private key is now obtained from a Java keystore which is backed by the PKCS11 provider
+
+create the following methods in the sample
+```java
+    private static Signer newHSMSigner(KeyStore ks, String alias) throws IOException, InvalidKeyException, UnrecoverableKeyException, KeyStoreException, NoSuchAlgorithmException {
+    	final PrivateKey pk = (PrivateKey)ks.getKey(alias, null);
+    	if (pk == null) {
+    		throw new IOException("No private key found");  // TODO: Need to fix
+    	}
+
+        return Signers.newPrivateKeySigner(pk);
+
+    }
+
+    private static KeyStore getKeyStore() throws KeyStoreException {
+        KeyStore ks = KeyStore.getInstance("PKCS11");
+        try {
+            ks.load(null, "98765432".toCharArray()); // It's the Pin
+        } catch(Exception e) {  // TODO: Need to fix
+            e.printStackTrace();
+        }
+        return ks;
+    }
+```
+
+In the main method, change the creation of the `Gateway.Builder` to use the HSMSigner
+
+```java
+        Gateway.Builder builder = Gateway.newInstance()
+                .identity(newIdentity())
+                .signer(newHSMSigner(getKeyStore(), "HSMUser"))  // <--- change this line
+                .connection(channel);
+```
+
+## Cleanup
+
 When you are finished running the samples, the local docker network can be brought down with the following command:
 
 `docker rm -f $(docker ps -aq) && docker network prune --force`
